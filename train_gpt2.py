@@ -620,8 +620,12 @@ if __name__ == "__main__":
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
-    assert args.total_batch_size % tokens_per_fwdbwd == 0
+    # do not assert this, as the default total batch size is 256, which is very small.   esp, it won't run 
+    # the command for 1 CPU at the begining of the file.   we try to "fix"
+    # assert args.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
+    if args.total_batch_size % tokens_per_fwdbwd != 0:
+        grad_accum_steps += 1 # fix it, 1 CPU can run 1 batch at a time,
     print0(f"total desired batch size: {args.total_batch_size}")
     print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 

@@ -575,6 +575,9 @@ if __name__ == "__main__":
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
+
+    # dev
+    parser.add_argument("--dev", type=int, default=1, help="dev mode")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -588,11 +591,17 @@ if __name__ == "__main__":
     if ddp:
         # use of DDP atm demands CUDA, we set the device appropriately according to rank
         assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-        init_process_group(backend='nccl')
+        if args.dev == 1:
+            init_process_group(backend='gloo')
+        else:
+            init_process_group(backend='nccl')
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])
-        device = f'cuda:{ddp_local_rank}'
+        if args.dev == 1:
+            device = 'cuda:0'
+        else:
+            device = f'cuda:{ddp_local_rank}'
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
         seed_offset = 0 # each process gets the exact same seed
@@ -708,7 +717,10 @@ if __name__ == "__main__":
 
     # here we wrap model into DDP container
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
+        if args.dev == 1:
+            model = DDP(model, device_ids=[0])
+        else:
+            model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
@@ -822,7 +834,11 @@ if __name__ == "__main__":
             if not args.inference_only:
                 loss.backward()
         if ddp:
-            dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
+            if args.dev == 1:
+                dist.all_reduce(lossf, op=dist.ReduceOp.SUM)
+                lossf /= ddp_world_size
+            else:
+                dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         # determine and set the learning rate for this iteration

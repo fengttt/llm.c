@@ -29,7 +29,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import torch._inductor.config as config
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.optim import ZeroRedundancyOptimizer
 import torch.distributed as dist
@@ -586,31 +585,31 @@ if __name__ == "__main__":
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48"}
 
-    # set up DDP (distributed data parallel). torchrun sets this env variable
-    ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-    if ddp:
-        # use of DDP atm demands CUDA, we set the device appropriately according to rank
-        assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    # set up pipeline parallelism. torchrun sets this env variable
+    pp = int(os.environ.get('RANK', -1)) != -1 # is this a pp run?
+    if pp:
+        # Pipeline parallelism
+        assert torch.cuda.is_available(), "for now i think we need CUDA for pipeline parallelism"
         if args.dev == 1:
             init_process_group(backend='gloo')
         else:
             init_process_group(backend='nccl')
-        ddp_rank = int(os.environ['RANK'])
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        pp_rank = int(os.environ['RANK'])
+        pp_local_rank = int(os.environ['LOCAL_RANK'])
+        pp_world_size = int(os.environ['WORLD_SIZE'])
         if args.dev == 1:
             device = 'cuda:0'
         else:
-            device = f'cuda:{ddp_local_rank}'
+            device = f'cuda:{pp_local_rank}'
         torch.cuda.set_device(device)
-        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+        master_process = pp_rank == 0 # this process will do logging, checkpointing etc.
         seed_offset = 0 # each process gets the exact same seed
         zero_stage = args.zero_stage
     else:
-        ddp_rank = 0
-        ddp_local_rank = 0
+        pp_rank = 0
+        pp_local_rank = 0
         zero_stage = 0
-        ddp_world_size = 1
+        pp_world_size = 1
         master_process = True
         seed_offset = 0
         # select the device
@@ -628,7 +627,7 @@ if __name__ == "__main__":
     device_type = 'cuda' if 'cuda' in device else 'cpu'
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
-    tokens_per_fwdbwd = B * T * ddp_world_size
+    tokens_per_fwdbwd = B * T 
     # do not assert this, as the default total batch size is 256, which is very small.   esp, it won't run 
     # the command for 1 CPU at the begining of the file.   we try to "fix"
     # assert args.total_batch_size % tokens_per_fwdbwd == 0
@@ -686,10 +685,10 @@ if __name__ == "__main__":
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    train_loader = DistributedDataLoader(args.input_bin, B, T, pp_rank, pp_world_size)
     val_loader = None
     if args.input_val_bin:
-        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+        val_loader = DistributedDataLoader(args.input_val_bin, B, T, pp_rank, pp_world_size)
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
@@ -715,13 +714,11 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # main training loop
 
-    # here we wrap model into DDP container
-    if ddp:
-        if args.dev == 1:
-            model = DDP(model, device_ids=[0])
-        else:
-            model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+    # here we wrap model into 
+    if pp:
+        # NYI
+        pass
+    raw_model = model.module if pp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
@@ -816,11 +813,15 @@ if __name__ == "__main__":
             # fetch a batch
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
-            if ddp:
+            if pp:
+                # NYI
+                #
                 # we want only the last micro-step to sync grads in a DDP model
                 # the official way to do this is with model.no_sync(), but that is a
                 # context manager that bloats the code, so we just toggle this variable
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+                # model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+                pass
+
             # forward pass
             with ctx:
                 _, loss = model(x, y, return_logits=False)
@@ -833,10 +834,10 @@ if __name__ == "__main__":
             # backward pass
             if not args.inference_only:
                 loss.backward()
-        if ddp:
+        if pp:
             if args.dev == 1:
                 dist.all_reduce(lossf, op=dist.ReduceOp.SUM)
-                lossf /= ddp_world_size
+                lossf /= pp_world_size
             else:
                 dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
@@ -858,7 +859,7 @@ if __name__ == "__main__":
         # time and print
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
-        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
+        tokens_per_second = grad_accum_steps * pp_world_size * B * T / (t1-t0)
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log to logile
         if master_process and logfile is not None:
@@ -876,5 +877,5 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     # clean up nice
-    if ddp:
+    if pp:
         destroy_process_group()
